@@ -5,12 +5,14 @@
 # e.g
 import asyncio
 import json
+import os
 import urllib
 from collections import defaultdict
 from itertools import product
 from time import time
 
 import websockets
+from redis import asyncio as aioredis
 
 
 class URLSlugify:
@@ -18,6 +20,7 @@ class URLSlugify:
         # to parse the url we use a built in python library: urllib
         self.message = message
         self.ident = message["job_data"]["ident"]
+        self.ts = message["ts"]
         self.url = urllib.parse.urlparse(message["url"])
         self.response_code = str(message["response_code"])
         self.is_error = message["is_error"]
@@ -54,35 +57,46 @@ class URLSlugify:
     @property
     def slugs(self):
         # we return a list of slugs to increment in redis
-        prefixes = [
-            (self.ident, "wget", self.wget_code),
-            (self.ident, "response", self.response_code),
-            (self.ident, "response", self.response_fuz),
-        ]
-        suffixes = [
-            (self.domain, "fullpath", self.fullpath),
-            (self.domain, "folder", self.path_first_folder),
-            (self.domain, "file", self.path_last_folder),
-        ]
+        prefixes = (
+            ("wget", (self.ident, self.wget_code)),
+            ("response", (self.ident, self.response_code)),
+            ("response", (self.ident, self.response_fuz)),
+        )
+        suffixes = (
+            ("fullpath", (self.domain, self.fullpath)),
+            ("folder", (self.domain, self.path_first_folder)),
+            ("file", (self.domain, self.path_last_folder)),
+        )
 
         if self.is_shopify:
-            suffixes.append((self.domain, "shopify"))
+            suffixes.append(("shopify", (self.ident)))
 
         if self.is_error:
-            prefixes.append((self.ident, "error"))
+            prefixes.append(("error", (self.ident)))
         else:
-            prefixes.append((self.ident, "success"))
+            prefixes.append(("success", (self.ident)))
 
-        self.identifiers.update([_id[1] for _id in prefixes + suffixes])
-        return [prefix + suffix for prefix, suffix in list(product(prefixes, suffixes))]
+        # now, flatten everything, so that we have like,
+        # response:fullpath:ident:domain:path
 
-
+        flattened = []
+        for prefix, suffix in product(prefixes, suffixes):
+            flattened.append((prefix[0], suffix[0], *prefix[1], *suffix[1]))
+        return flattened
 async def main():
-    BIG_DICTIONARY = defaultdict(int)
+    TIMEBUCKETS = [
+        60,
+        600,
+        3_600,
+        86_400,
+    ]
+    BIG_DICTIONARY = defaultdict(list)
     IDENTIFIERS = set()
     TIME = time()
     # connect to ws://archivebot.archivingyoursh.it:4568/stream
     uri = "ws://archivebot.archivingyoursh.it:4568/stream"
+    R = await aioredis.create_redis_pool(os.getenv("REDIS_URL", "redis://localhost"))
+
     async with websockets.connect(uri) as websocket:
         async for message in websocket:
             try:
@@ -91,10 +105,16 @@ async def main():
                 print("error parsing message...")
                 continue
             try:
+                to_add = defaultdict(list)
                 url_slugify = URLSlugify(message)
                 for slugs in url_slugify.slugs:
-                    BIG_DICTIONARY[":".join(slugs)] += 1
+                    for bucket in TIMEBUCKETS:
+                        to_add[f"{bucket}:{":".join(slugs)}"].append(url_slugify.ts)
                 IDENTIFIERS.update(url_slugify.identifiers)
+                with await R.pipeline() as pipe:
+                    for key, value in to_add.items():
+                        pipe.zadd(key, *value)
+                    await pipe.execute()
             except Exception as e:
                 import traceback
 
@@ -103,21 +123,45 @@ async def main():
                     continue
                 print("error parsing", message)
                 traceback.print_exc()
-            if time() - TIME > 1:
-                TIME = time()
-                for identifier in IDENTIFIERS:
-                    print(f"TOP 3 SLUGS FOR {identifier}")
-                    # to find it, we have to split :, and match on 1 element
-                    candidates = [
-                        (k, v)
-                        for k, v in BIG_DICTIONARY.items()
-                        if k.split(":")[1] == identifier
-                        or (len(k) >= 5 and k.split(":")[4] == identifier)
-                    ]
-                    candidates.sort(key=lambda x: x[1], reverse=True)
-                    for k, v in candidates[:3]:
-                        print(k, v)
-                print("END OF TOP 3 SLUGS")
+
+
+# ^ above is the main loop,
+# only one should be running.
+# below is the analysis loop,
+# any can run, as they just read the data from the redis and make analysis.
+def analysis(self):
+
+    async def main():
+        R = await aioredis.create_redis_pool(
+            os.getenv("REDIS_URL", "redis://localhost")
+        )
+        TIMEBUCKETS = [
+            60,
+            600,
+            3_600,
+            86_400,
+        ]
+
+        # let's start by ensuring the timebuckets are properly cleaned up with the appropriate timebuckets.
+
+        async def cleanup():
+            # target_time should be 5 seconds ago, just to make sure we don't deal with unfinished data.
+            target_time = int(time()) - 5
+            for bucket in TIMEBUCKETS:
+                for key in await R.keys(f"{bucket}:*"):
+                    await R.zremrangebyscore(key, 0, target_time)
+
+        await cleanup()
+
+        # then, we can start the analysis.
+
+        for ident in []:
+            for bucket in TIMEBUCKETS:
+                for key in await R.keys(f"{bucket}:{ident}:*"):
+                    print(key, await R.zrange(key, 0, -1))
+
+    asyncio.run(main())
+
 
 if __name__ == "__main__":
     asyncio.run(main())
